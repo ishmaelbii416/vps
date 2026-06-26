@@ -633,8 +633,28 @@ async def read_header(reader):
 
 
 def is_upgrade(header: bytes) -> bool:
+    """
+    Return True when this HTTP request should trigger a 101 tunnel.
+
+    Cloudflare and most CDN proxies STRIP hop-by-hop headers (Connection,
+    Upgrade) before forwarding to the origin.  So we cannot rely on seeing
+    'Upgrade: websocket' on the origin side.
+
+    Instead we recognise the METHOD the HTTP Custom payload uses:
+      • UNLOCK  — WebDAV method, always a tunnel trigger in this context
+      • PROPFIND / MOVE / COPY — other WebDAV methods sometimes used
+      • Any method carrying Upgrade/websocket headers (direct connection)
+    """
     h = header.lower()
-    return b"upgrade" in h or b"websocket" in h
+    first = header.split(b"\r\n")[0].upper()
+    # Direct WebSocket upgrade (no CDN stripping)
+    if b"upgrade" in h or b"websocket" in h:
+        return True
+    # WebDAV tunnel-trigger methods (CDN strips headers, method survives)
+    if first.startswith((b"UNLOCK ", b"PROPFIND ", b"MOVE ", b"COPY ",
+                          b"MKCOL ", b"LOCK ")):
+        return True
+    return False
 
 
 def is_connect(header: bytes) -> bool:
@@ -643,10 +663,10 @@ def is_connect(header: bytes) -> bool:
 
 
 def is_probe(header: bytes) -> bool:
-    """Detect CDN probe/trace requests that need a 200 keep-alive reply."""
+    """CDN probe/trace GET requests — reply 200 and keep reading."""
     first = header.split(b"\r\n")[0].upper()
     return first.startswith(b"GET ") and (
-        b"/CDN-CGI/" in first or b"TRACE" in first
+        b"/CDN-CGI/" in first or b"TRACE" in first or b"/TRACE" in first
     )
 
 
