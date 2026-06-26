@@ -268,14 +268,25 @@ systemctl restart badvpn-udpgw@${UDPGW_PORT1} badvpn-udpgw@${UDPGW_PORT2}
 log "BadVPN UDP gateway on ports ${UDPGW_PORT1} and ${UDPGW_PORT2}"
 
 # ════════════════════════════════════════════════════════════════
-step "STEP 7 — NGINX (WebSocket Proxy + HTTP Custom)"
+step "STEP 7 — NGINX (WebSocket Proxy, internal port 8181)"
 # ════════════════════════════════════════════════════════════════
+# NOTE: ws-epro owns port 80 for HTTP Custom 101 handling.
+#       NGINX runs on 8181 (internal) for path-based WS routing.
+#       NGINX on 8080 handles WSS (TLS WebSocket).
 rm -f /etc/nginx/sites-enabled/*
 cat > /etc/nginx/conf.d/vps-tunnel.conf <<NGINXCONF
-# HTTP Custom / SSH-WS Proxy
+# ── Internal WebSocket path router (HTTP) ──
 server {
-    listen ${SSH_WS_PORT};
-    server_name ${DOMAIN};
+    listen 8181;
+    server_name ${DOMAIN} _;
+
+    # No body size limit — never return 413
+    client_max_body_size 0;
+    proxy_request_buffering off;
+
+    # Allow non-standard methods (UNLOCK, CONNECT, etc.)
+    error_page 405 = @handle_any;
+    location @handle_any { proxy_pass http://127.0.0.1:8880; }
 
     location /ssh-ws {
         proxy_pass http://127.0.0.1:${SSH_PORT};
@@ -289,6 +300,57 @@ server {
 
     location /dropbear-ws {
         proxy_pass http://127.0.0.1:${DROPBEAR_PORT};
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "Upgrade";
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }
+
+    location /vmess-ws {
+        proxy_pass http://127.0.0.1:${XRAY_WS_PORT};
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "Upgrade";
+        proxy_read_timeout 3600s;
+    }
+
+    location /trojan-ws {
+        proxy_pass http://127.0.0.1:2087;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "Upgrade";
+        proxy_read_timeout 3600s;
+    }
+
+    location / {
+        proxy_pass http://127.0.0.1:8880;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \$http_connection;
+        proxy_set_header Host \$host;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        client_max_body_size 0;
+        proxy_request_buffering off;
+    }
+}
+
+# ── WSS (TLS WebSocket, port 8080) ──
+server {
+    listen ${SSH_WSS_PORT} ssl;
+    server_name ${DOMAIN} _;
+
+    ssl_certificate /etc/xray/ssl/cert.crt;
+    ssl_certificate_key /etc/xray/ssl/private.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+
+    client_max_body_size 0;
+    proxy_request_buffering off;
+
+    location /ssh-ws {
+        proxy_pass http://127.0.0.1:${SSH_PORT};
         proxy_http_version 1.1;
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection "Upgrade";
@@ -312,49 +374,19 @@ server {
     }
 
     location / {
-        return 200 'VPS Tunnel Active';
-        add_header Content-Type text/plain;
-    }
-}
-
-# HTTPS/WSS
-server {
-    listen ${SSH_WSS_PORT} ssl;
-    server_name ${DOMAIN};
-
-    ssl_certificate /etc/xray/ssl/cert.crt;
-    ssl_certificate_key /etc/xray/ssl/private.key;
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers HIGH:!aNULL:!MD5;
-
-    location /ssh-ws {
-        proxy_pass http://127.0.0.1:${SSH_PORT};
+        proxy_pass http://127.0.0.1:8880;
         proxy_http_version 1.1;
         proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "Upgrade";
+        proxy_set_header Connection \$http_connection;
         proxy_read_timeout 3600s;
-    }
-
-    location /vmess-ws {
-        proxy_pass http://127.0.0.1:${XRAY_WS_PORT};
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "Upgrade";
-        proxy_read_timeout 3600s;
-    }
-
-    location /trojan-ws {
-        proxy_pass http://127.0.0.1:2087;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "Upgrade";
-        proxy_read_timeout 3600s;
+        client_max_body_size 0;
+        proxy_request_buffering off;
     }
 }
 NGINXCONF
 
 nginx -t 2>/dev/null && systemctl enable --quiet nginx && systemctl restart nginx
-log "NGINX running (HTTP:${SSH_WS_PORT}, HTTPS:${SSH_WSS_PORT})"
+log "NGINX running (internal:8181, WSS:${SSH_WSS_PORT})"
 
 # ════════════════════════════════════════════════════════════════
 step "STEP 8 — HAProxy (Port 443 multiplexer)"
@@ -537,62 +569,158 @@ systemctl restart zivpn
 log "ZiVPN WebSocket relay on port ${ZIVPN_PORT}"
 
 # ════════════════════════════════════════════════════════════════
-step "STEP 12 — WS-ePRO (HTTP Upgrade WebSocket to SSH)"
+step "STEP 12 — WS-ePRO (HTTP Custom multi-split payload handler)"
 # ════════════════════════════════════════════════════════════════
-# Python-based ws-epro (HTTP CONNECT + WebSocket upgrade proxy)
-cat > /usr/local/bin/ws-epro.py <<WSPY
+# WS-ePRO listens on port 80 AND 8880.
+# Handles HTTP Custom's 3-part [split] payload correctly:
+#   Part 1 (GET /cdn-cgi/trace)  → 200 OK, keep reading
+#   Part 2 (UNLOCK + Upgrade)    → 101 Switching Protocols → SSH tunnel
+#   Part 3 (Content-Length:9999) → never sent; CDN already tunneling
+# Responds 101 IMMEDIATELY on seeing Upgrade header — no body read.
+cat > /usr/local/bin/ws-epro.py <<'WSPY'
 #!/usr/bin/env python3
-"""WS-ePRO: HTTP CONNECT + WebSocket upgrade proxy to SSH"""
-import asyncio, socket, sys
+"""
+WS-ePRO — HTTP Custom multi-split payload proxy
+Listens on port 80 and 8880, tunnels SSH via WebSocket upgrade.
+"""
+import asyncio
+import sys
 
-LISTEN_PORT = 8880
 SSH_HOST = "127.0.0.1"
-SSH_PORT = 22
+SSH_PORT  = 22
+LISTEN_PORTS = [80, 8880]
 
-RESPONSE_101 = (
+R101 = (
     b"HTTP/1.1 101 Switching Protocols\r\n"
     b"Upgrade: websocket\r\n"
-    b"Connection: Upgrade\r\n\r\n"
+    b"Connection: Upgrade\r\n"
+    b"\r\n"
 )
-RESPONSE_200 = b"HTTP/1.1 200 Connection established\r\n\r\n"
+R200 = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"
+R200_CONN = b"HTTP/1.1 200 Connection established\r\n\r\n"
 
-async def pipe(reader, writer):
+
+async def pipe(src_r, dst_w):
+    """One-direction byte pipe."""
     try:
         while True:
-            data = await reader.read(4096)
-            if not data: break
-            writer.write(data)
-            await writer.drain()
-    except:
+            data = await src_r.read(32768)
+            if not data:
+                break
+            dst_w.write(data)
+            await dst_w.drain()
+    except Exception:
         pass
     finally:
-        try: writer.close()
-        except: pass
+        try:
+            dst_w.close()
+        except Exception:
+            pass
+
+
+async def read_header(reader):
+    """Read bytes until \\r\\n\\r\\n without consuming the body."""
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        chunk = await asyncio.wait_for(reader.read(4096), timeout=30)
+        if not chunk:
+            return None
+        buf += chunk
+        # Safety cap — if no header end in 64 KB, abort
+        if len(buf) > 65536:
+            return None
+    return buf
+
+
+def is_upgrade(header: bytes) -> bool:
+    h = header.lower()
+    return b"upgrade" in h or b"websocket" in h
+
+
+def is_connect(header: bytes) -> bool:
+    first = header.split(b"\r\n")[0].upper()
+    return first.startswith(b"CONNECT ")
+
+
+def is_probe(header: bytes) -> bool:
+    """Detect CDN probe/trace requests that need a 200 keep-alive reply."""
+    first = header.split(b"\r\n")[0].upper()
+    return first.startswith(b"GET ") and (
+        b"/CDN-CGI/" in first or b"TRACE" in first
+    )
+
 
 async def handle(reader, writer):
+    peer = writer.get_extra_info("peername")
     try:
-        header = b""
-        while b"\r\n\r\n" not in header:
-            chunk = await reader.read(1024)
-            if not chunk: return
-            header += chunk
-        if b"websocket" in header.lower() or b"upgrade" in header.lower():
-            writer.write(RESPONSE_101)
-        elif b"CONNECT" in header:
-            writer.write(RESPONSE_200)
-        else:
-            writer.write(RESPONSE_101)
-        await writer.drain()
-        sr, sw = await asyncio.open_connection(SSH_HOST, SSH_PORT)
-        await asyncio.gather(pipe(reader, sw), pipe(sr, writer))
-    except:
+        while True:
+            header = await read_header(reader)
+            if header is None:
+                return
+
+            # ── Case 1: Upgrade / WebSocket / UNLOCK+upgrade → 101 ──
+            if is_upgrade(header):
+                writer.write(R101)
+                await writer.drain()
+                # Open SSH and pipe bidirectionally
+                try:
+                    sr, sw = await asyncio.open_connection(SSH_HOST, SSH_PORT)
+                except Exception:
+                    return
+                await asyncio.gather(pipe(reader, sw), pipe(sr, writer))
+                return
+
+            # ── Case 2: CONNECT tunnel ──
+            elif is_connect(header):
+                writer.write(R200_CONN)
+                await writer.drain()
+                try:
+                    sr, sw = await asyncio.open_connection(SSH_HOST, SSH_PORT)
+                except Exception:
+                    return
+                await asyncio.gather(pipe(reader, sw), pipe(sr, writer))
+                return
+
+            # ── Case 3: CDN probe (GET /cdn-cgi/trace …) → 200, loop ──
+            elif is_probe(header):
+                writer.write(R200)
+                await writer.drain()
+                # Stay in loop — HTTP Custom sends next split request
+
+            # ── Case 4: Anything else → 200, loop ──
+            else:
+                writer.write(R200)
+                await writer.drain()
+
+    except asyncio.TimeoutError:
         pass
+    except Exception:
+        pass
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
+
 
 async def main():
-    srv = await asyncio.start_server(handle, "0.0.0.0", LISTEN_PORT)
-    print(f"WS-ePRO listening on port {LISTEN_PORT}")
-    async with srv:
-        await srv.serve_forever()
+    servers = []
+    for port in LISTEN_PORTS:
+        try:
+            srv = await asyncio.start_server(handle, "0.0.0.0", port)
+            servers.append(srv)
+            print(f"[WS-ePRO] listening on port {port}", flush=True)
+        except OSError as e:
+            print(f"[WS-ePRO] cannot bind port {port}: {e}", flush=True)
+
+    if not servers:
+        print("[WS-ePRO] no ports available — exiting", flush=True)
+        sys.exit(1)
+
+    async with asyncio.TaskGroup() as tg:
+        for srv in servers:
+            tg.create_task(srv.serve_forever())
+
 
 asyncio.run(main())
 WSPY
@@ -600,7 +728,7 @@ chmod +x /usr/local/bin/ws-epro.py
 
 cat > /etc/systemd/system/ws-epro.service <<WSESVC
 [Unit]
-Description=WS-ePRO HTTP WebSocket to SSH Proxy
+Description=WS-ePRO HTTP Custom multi-split WebSocket-SSH proxy
 After=network.target
 
 [Service]
@@ -608,6 +736,7 @@ Type=simple
 ExecStart=/usr/bin/python3 /usr/local/bin/ws-epro.py
 Restart=on-failure
 RestartSec=5
+LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target
@@ -615,7 +744,7 @@ WSESVC
 systemctl daemon-reload
 systemctl enable --quiet ws-epro
 systemctl restart ws-epro
-log "WS-ePRO proxy on port 8880"
+log "WS-ePRO proxy on ports 80 and 8880 (HTTP Custom multi-split ready)"
 
 # ════════════════════════════════════════════════════════════════
 step "STEP 13 — SSH account management scripts"
